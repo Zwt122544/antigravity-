@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -134,17 +135,18 @@ def get_manifest_repo():
     return normalize_github_repo(repo) or normalize_github_repo(m.get("homepage", ""))
 
 
-def http_get_bytes(url, timeout=12, headers=None):
+def http_get_bytes(url, timeout=12, headers=None, return_final_url=False):
     """Fetch URL with direct-first fallback so broken local proxies don't block GitHub."""
     req_headers = {
         "User-Agent": f"antigravity-linux-monitor/{get_local_version()}",
-        "Accept": "application/vnd.github+json",
     }
+    gh_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if gh_token and "api.github.com" in url:
+        req_headers["Authorization"] = f"token {gh_token}"
     if headers:
         req_headers.update(headers)
     req = urllib.request.Request(url, headers=req_headers)
 
-    # Try default opener first, then direct (no-proxy) if proxy fails, and vice versa
     openers = [
         urllib.request.build_opener(urllib.request.ProxyHandler({})),
         urllib.request.build_opener(),
@@ -153,12 +155,62 @@ def http_get_bytes(url, timeout=12, headers=None):
     for opener in openers:
         try:
             with opener.open(req, timeout=timeout) as resp:
-                return resp.read(), resp.headers
+                data = resp.read()
+                if return_final_url:
+                    return data, resp.headers, resp.geturl()
+                return data, resp.headers
         except urllib.error.HTTPError:
             raise
         except Exception as exc:
             last_err = exc
     raise last_err or RuntimeError("Network request failed")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def resolve_github_latest_tag(repo, timeout=10):
+    """
+    Resolve latest GitHub Release tag WITHOUT calling api.github.com
+    (completely avoids GitHub's 60 req/hr unauthenticated IP rate limit).
+    https://github.com/{repo}/releases/latest redirects (302) to .../releases/tag/<tag>.
+    """
+    url = f"https://github.com/{repo}/releases/latest"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": f"antigravity-linux-monitor/{get_local_version()}"},
+    )
+    openers = [
+        urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler()),
+        urllib.request.build_opener(_NoRedirectHandler()),
+    ]
+    last_err = None
+    for opener in openers:
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                final_url = resp.geturl()
+                m = re.search(r"/releases/tag/([^/?#]+)", final_url)
+                if m:
+                    return urllib.parse.unquote(m.group(1)), final_url
+                return "", final_url
+        except urllib.error.HTTPError as he:
+            if he.code in (301, 302, 303, 307, 308):
+                loc = he.headers.get("Location", "")
+                m = re.search(r"/releases/tag/([^/?#]+)", loc)
+                if m:
+                    tag = urllib.parse.unquote(m.group(1))
+                    return tag, f"https://github.com/{repo}/releases/tag/{tag}"
+                return "", loc
+            if he.code == 404:
+                return "", ""
+            last_err = he
+        except Exception as exc:
+            last_err = exc
+    if last_err:
+        raise last_err
+    return "", ""
 
 
 class SettingsStore:
@@ -293,31 +345,56 @@ class PluginUpdater:
         source = "release"
 
         try:
-            # 1) Try latest GitHub Release first
-            api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+            # 1) Primary: Rate-limit-free GitHub Releases redirect check (never hits 403 API limit!)
+            tag, rel_url = "", ""
             try:
-                raw, _ = http_get_bytes(api_url, timeout=10)
-                rel = json.loads(raw.decode("utf-8"))
-                tag = str(rel.get("tag_name") or "").strip()
-                latest_ver = tag.lstrip("vV") or str(rel.get("name") or "").strip()
-                release_name = str(rel.get("name") or tag or latest_ver)
-                release_notes = str(rel.get("body") or "").strip()[:2000]
-                release_url = str(rel.get("html_url") or release_url)
-                tarball_url = str(rel.get("tarball_url") or f"https://api.github.com/repos/{repo}/tarball/{tag}")
-                published_at = str(rel.get("published_at") or "")
-            except urllib.error.HTTPError as he:
-                if he.code != 404:
-                    raise
-                # 2) No Release yet -> fallback to main branch plugin.json
+                tag, rel_url = resolve_github_latest_tag(repo, timeout=10)
+            except Exception:
+                tag = ""
+
+            if tag:
+                source = "release"
+                latest_ver = tag.lstrip("vV")
+                release_name = tag
+                release_url = rel_url or f"https://github.com/{repo}/releases/tag/{tag}"
+                # Direct github.com archive URL (also bypasses api.github.com rate limit!)
+                tarball_url = f"https://github.com/{repo}/archive/refs/tags/{tag}.tar.gz"
+
+                # Best-effort enrichment for release notes via GitHub API (gracefully ignored on 403/429)
+                try:
+                    raw_api, _ = http_get_bytes(
+                        f"https://api.github.com/repos/{repo}/releases/tags/{tag}",
+                        timeout=6,
+                        headers={"Accept": "application/vnd.github+json"},
+                    )
+                    rel = json.loads(raw_api.decode("utf-8"))
+                    release_name = str(rel.get("name") or tag)
+                    release_notes = str(rel.get("body") or "").strip()[:2000]
+                    published_at = str(rel.get("published_at") or "")
+                except Exception:
+                    pass
+            else:
+                # 2) Fallback: Rate-limit-free raw.githubusercontent.com or jsDelivr mirror
                 source = "branch"
-                manifest_url = f"https://raw.githubusercontent.com/{repo}/main/plugin.json"
-                raw, _ = http_get_bytes(manifest_url, timeout=10)
+                raw = None
+                last_fb_err = None
+                for manifest_url in (
+                    f"https://raw.githubusercontent.com/{repo}/main/plugin.json",
+                    f"https://cdn.jsdelivr.net/gh/{repo}@main/plugin.json",
+                ):
+                    try:
+                        raw, _ = http_get_bytes(manifest_url, timeout=10)
+                        break
+                    except Exception as exc:
+                        last_fb_err = exc
+                if raw is None:
+                    raise last_fb_err or RuntimeError("Unable to reach GitHub or jsDelivr mirror")
                 remote_m = json.loads(raw.decode("utf-8"))
                 latest_ver = str(remote_m.get("version") or "").strip()
                 release_name = f"main (v{latest_ver})" if latest_ver else "main"
-                release_notes = "Latest commit on main branch (no GitHub Release tag found yet)."
+                release_notes = ""
                 release_url = f"https://github.com/{repo}"
-                tarball_url = f"https://api.github.com/repos/{repo}/tarball/main"
+                tarball_url = f"https://github.com/{repo}/archive/refs/heads/main.tar.gz"
 
             has_update = bool(latest_ver and parse_semver(latest_ver) > parse_semver(cur))
             res = {

@@ -2,7 +2,7 @@
   "name": "linux-monitor",
   "displayName": "Linux Server Monitor",
   "description": "Real-time Linux server resource monitor in the Antigravity sidebar and side pane with live charts for CPU, per-core heatmap, memory, NVIDIA GPU utilization and VRAM, network speed, disk I/O, processes, bilingual UI (中文/EN), and one-click GitHub hot updates.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": {
     "name": "Zwt122544",
     "url": "https://github.com/Zwt122544"
